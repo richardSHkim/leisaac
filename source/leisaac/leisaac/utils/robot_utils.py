@@ -5,11 +5,14 @@ import torch
 from isaaclab.envs import DirectRLEnv, ManagerBasedEnv
 from isaaclab.sensors import Camera
 from leisaac.assets.robots.lerobot import (
+    PIPER_FOLLOWER_MOTOR_LIMITS,
+    PIPER_FOLLOWER_USD_JOINT_LIMITS,
     SO101_FOLLOWER_MOTOR_LIMITS,
     SO101_FOLLOWER_REST_POSE_RANGE,
     SO101_FOLLOWER_USD_JOINT_LIMLITS,
 )
 from leisaac.enhance.datasets.lerobot_dataset_handler import LeRobotDatasetCfg
+from leisaac.utils.constant import PIPER_SINGLE_ARM_JOINT_NAMES, SINGLE_ARM_JOINT_NAMES
 
 
 @dataclass
@@ -93,7 +96,28 @@ def is_so101_at_rest_pose(joint_pos: torch.Tensor, joint_names: list[str]) -> to
     return is_reset
 
 
-def convert_leisaac_action_to_lerobot(action: torch.Tensor | np.ndarray) -> np.ndarray:
+def get_lerobot_joint_names(task_type: str | None = None, robot_name: str | None = None) -> list[str]:
+    if task_type == "piperleader" or robot_name == "piper_follower":
+        return [f"{joint_name}.pos" for joint_name in PIPER_SINGLE_ARM_JOINT_NAMES]
+    return [f"{joint_name}.pos" for joint_name in SINGLE_ARM_JOINT_NAMES]
+
+
+def _resolve_embodiment(
+    task_type: str | None = None, joint_names: list[str] | None = None, robot_name: str | None = None
+) -> str:
+    if task_type == "piperleader" or robot_name == "piper_follower":
+        return "piper"
+    if joint_names and any(name.startswith("joint_") for name in joint_names):
+        return "piper"
+    return "so101"
+
+
+def convert_leisaac_action_to_lerobot(
+    action: torch.Tensor | np.ndarray,
+    task_type: str | None = None,
+    joint_names: list[str] | None = None,
+    robot_name: str | None = None,
+) -> np.ndarray:
     """
     Convert the action from LeIsaac to Lerobot. Just convert value, not include the format.
     """
@@ -101,6 +125,20 @@ def convert_leisaac_action_to_lerobot(action: torch.Tensor | np.ndarray) -> np.n
         action = action.cpu().numpy()
 
     processed_action = np.zeros_like(action)
+    embodiment = _resolve_embodiment(task_type=task_type, joint_names=joint_names, robot_name=robot_name)
+
+    if embodiment == "piper":
+        joint_limits = PIPER_FOLLOWER_USD_JOINT_LIMITS
+        motor_limits = PIPER_FOLLOWER_MOTOR_LIMITS
+        for idx, joint_name in enumerate(joint_limits):
+            motor_limit_range = motor_limits[joint_name]
+            joint_limit_range = joint_limits[joint_name]
+            joint_range = joint_limit_range[1] - joint_limit_range[0]
+            motor_range = motor_limit_range[1] - motor_limit_range[0]
+            joint_value = action[:, idx] - joint_limit_range[0]
+            processed_action[:, idx] = joint_value / joint_range * motor_range + motor_limit_range[0]
+        return processed_action
+
     joint_limits = SO101_FOLLOWER_USD_JOINT_LIMLITS
     motor_limits = SO101_FOLLOWER_MOTOR_LIMITS
     action = action / torch.pi * 180.0  # convert to degree
@@ -116,7 +154,12 @@ def convert_leisaac_action_to_lerobot(action: torch.Tensor | np.ndarray) -> np.n
     return processed_action
 
 
-def convert_lerobot_action_to_leisaac(action: torch.Tensor | np.ndarray) -> np.ndarray:
+def convert_lerobot_action_to_leisaac(
+    action: torch.Tensor | np.ndarray,
+    task_type: str | None = None,
+    joint_names: list[str] | None = None,
+    robot_name: str | None = None,
+) -> np.ndarray:
     """
     Convert the action from Lerobot to LeIsaac. Just convert value, not include the format.
     """
@@ -124,6 +167,20 @@ def convert_lerobot_action_to_leisaac(action: torch.Tensor | np.ndarray) -> np.n
         action = action.cpu().numpy()
 
     processed_action = np.zeros_like(action)
+    embodiment = _resolve_embodiment(task_type=task_type, joint_names=joint_names, robot_name=robot_name)
+
+    if embodiment == "piper":
+        joint_limits = PIPER_FOLLOWER_USD_JOINT_LIMITS
+        motor_limits = PIPER_FOLLOWER_MOTOR_LIMITS
+        for idx, joint_name in enumerate(joint_limits):
+            motor_limit_range = motor_limits[joint_name]
+            joint_limit_range = joint_limits[joint_name]
+            motor_range = motor_limit_range[1] - motor_limit_range[0]
+            joint_range = joint_limit_range[1] - joint_limit_range[0]
+            motor_value = action[:, idx] - motor_limit_range[0]
+            processed_action[:, idx] = motor_value / motor_range * joint_range + joint_limit_range[0]
+        return processed_action
+
     joint_limits = SO101_FOLLOWER_USD_JOINT_LIMLITS
     motor_limits = SO101_FOLLOWER_MOTOR_LIMITS
 

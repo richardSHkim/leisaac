@@ -5,7 +5,7 @@ def dynamic_reset_gripper_effort_limit_sim(env, teleop_device):
     need_to_set = []
     if "bi-so101leader" in teleop_device:
         need_to_set = [env.scene.articulations["left_arm"], env.scene.articulations["right_arm"]]
-    elif "so101leader" in teleop_device or teleop_device in ["keyboard", "gamepad"]:
+    elif "so101leader" in teleop_device or teleop_device in ["keyboard", "gamepad", "piperleader"]:
         need_to_set = [env.scene["robot"]]
     for arm in need_to_set:
         write_gripper_effort_limit_sim(env, arm)
@@ -40,14 +40,19 @@ def write_gripper_effort_limit_sim(env, env_arm):
 
     target_effort_limits = (target_masses / 0.15).to(env_arm._data.joint_effort_limits.device)
 
-    current_effort_limit_sim = env_arm._data.joint_effort_limits[:, -1]  # [num_envs]
+    if {"joint7", "joint8"}.issubset(set(env_arm.joint_names)):
+        gripper_joint_ids = [env_arm.joint_names.index("joint7"), env_arm.joint_names.index("joint8")]
+        current_effort_limit_sim = env_arm._data.joint_effort_limits[:, gripper_joint_ids[0]]
+    else:
+        gripper_joint_ids = [5]
+        current_effort_limit_sim = env_arm._data.joint_effort_limits[:, -1]
     need_update = torch.abs(target_effort_limits - current_effort_limit_sim) > 0.1
 
     if torch.any(need_update):
         new_limits = current_effort_limit_sim.clone()
         new_limits[need_update] = target_effort_limits[need_update]
-
-        env_arm.write_joint_effort_limit_to_sim(limits=new_limits, joint_ids=[5 for _ in range(num_envs)])
+        limits = new_limits.unsqueeze(-1).repeat(1, len(gripper_joint_ids))
+        env_arm.write_joint_effort_limit_to_sim(limits=limits, joint_ids=gripper_joint_ids)
 
 
 def get_task_type(task: str, task_type: str | None = None) -> str:
@@ -60,6 +65,8 @@ def get_task_type(task: str, task_type: str | None = None) -> str:
         return "bi-so101leader"
     elif "LeKiwi" in task:
         return "lekiwi-leader"
+    elif "PiPER" in task:
+        return "piperleader"
     else:
         return "so101leader"
 

@@ -12,6 +12,7 @@ def object_grasped(
     object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
     diff_threshold: float = 0.02,
     grasp_threshold: float = 0.26,
+    gripper_joint_name: str = "gripper",
 ) -> torch.Tensor:
     """Check if an object is grasped by the specified robot."""
     robot: Articulation = env.scene[robot_cfg.name]
@@ -22,6 +23,7 @@ def object_grasped(
     end_effector_pos = ee_frame.data.target_pos_w[:, 1, :]
     pos_diff = torch.linalg.vector_norm(object_pos - end_effector_pos, dim=1)
 
-    grasped = torch.logical_and(pos_diff < diff_threshold, robot.data.joint_pos[:, -1] < grasp_threshold)
+    gripper_joint_idx = robot.data.joint_names.index(gripper_joint_name)
+    grasped = torch.logical_and(pos_diff < diff_threshold, robot.data.joint_pos[:, gripper_joint_idx] < grasp_threshold)
 
     return grasped

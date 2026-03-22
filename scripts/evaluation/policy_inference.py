@@ -12,6 +12,7 @@ from isaaclab.app import AppLauncher
 # add argparse arguments
 parser = argparse.ArgumentParser(description="leisaac inference for leisaac in the simulation.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--task_type", type=str, default=None, help="Optional teleop/policy task type override.")
 parser.add_argument("--step_hz", type=int, default=60, help="Environment stepping rate in Hz.")
 parser.add_argument("--seed", type=int, default=None, help="Seed of the environment.")
 parser.add_argument("--episode_length_s", type=float, default=60.0, help="Episode length in seconds.")
@@ -130,11 +131,72 @@ def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: s
         raise ValueError(f"Model type {model_type} not supported")
 
 
+def build_policy(env: ManagerBasedRLEnv, task_type: str):
+    from isaaclab.sensors import Camera
+
+    camera_keys = [key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)]
+    camera_infos = {key: sensor.image_shape for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)}
+
+    if args_cli.policy_type == "gr00tn1.5":
+        from leisaac.policy import Gr00tServicePolicyClient
+
+        modality_keys = ["arm_joints", "gripper"] if task_type == "piperleader" else ["single_arm", "gripper"]
+        return Gr00tServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            timeout_ms=args_cli.policy_timeout_ms,
+            camera_keys=camera_keys,
+            modality_keys=modality_keys,
+            task_type=task_type,
+        )
+
+    if args_cli.policy_type == "gr00tn1.6":
+        from leisaac.policy import Gr00t16ServicePolicyClient
+
+        modality_keys = ["arm_joints", "gripper"] if task_type == "piperleader" else ["single_arm", "gripper"]
+        return Gr00t16ServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            timeout_ms=args_cli.policy_timeout_ms,
+            camera_keys=camera_keys,
+            modality_keys=modality_keys,
+            task_type=task_type,
+        )
+
+    if "lerobot" in args_cli.policy_type:
+        from leisaac.policy import LeRobotServicePolicyClient
+
+        policy_type = args_cli.policy_type.split("-", maxsplit=1)[1]
+        return LeRobotServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            timeout_ms=args_cli.policy_timeout_ms,
+            camera_infos=camera_infos,
+            task_type=task_type,
+            policy_type=policy_type,
+            pretrained_name_or_path=args_cli.policy_checkpoint_path,
+            actions_per_chunk=args_cli.policy_action_horizon,
+            device=args_cli.device,
+        )
+
+    if args_cli.policy_type == "openpi":
+        from leisaac.policy import OpenPIServicePolicyClient
+
+        return OpenPIServicePolicyClient(
+            host=args_cli.policy_host,
+            port=args_cli.policy_port,
+            camera_keys=camera_keys,
+            task_type=task_type,
+        )
+
+    raise ValueError(f"Unsupported policy type: {args_cli.policy_type}")
+
+
 def main():
     """Running lerobot teleoperation with leisaac manipulation environment."""
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
-    task_type = get_task_type(args_cli.task)
+    task_type = get_task_type(args_cli.task, task_type=args_cli.task_type)
     env_cfg.use_teleop_device(task_type)
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
     env_cfg.episode_length_s = args_cli.episode_length_s
@@ -150,70 +212,8 @@ def main():
     env: ManagerBasedRLEnv = gym.make(args_cli.task, cfg=env_cfg).unwrapped
 
     # create policy
-    model_type = args_cli.policy_type
-    if args_cli.policy_type == "gr00tn1.5":
-        from isaaclab.sensors import Camera
-        from leisaac.policy import Gr00tServicePolicyClient
-
-        if task_type == "so101leader":
-            modality_keys = ["single_arm", "gripper"]
-        else:
-            raise ValueError(f"Task type {task_type} not supported when using GR00T N1.5 policy yet.")
-
-        policy = Gr00tServicePolicyClient(
-            host=args_cli.policy_host,
-            port=args_cli.policy_port,
-            timeout_ms=args_cli.policy_timeout_ms,
-            camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
-            modality_keys=modality_keys,
-        )
-    elif args_cli.policy_type == "gr00tn1.6":
-        from isaaclab.sensors import Camera
-        from leisaac.policy import Gr00t16ServicePolicyClient
-
-        if task_type == "so101leader":
-            modality_keys = ["single_arm", "gripper"]
-        else:
-            raise ValueError(f"Task type {task_type} not supported when using GR00T N1.5 policy yet.")
-
-        policy = Gr00t16ServicePolicyClient(
-            host=args_cli.policy_host,
-            port=args_cli.policy_port,
-            timeout_ms=args_cli.policy_timeout_ms,
-            camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
-            modality_keys=modality_keys,
-        )
-
-    elif "lerobot" in args_cli.policy_type:
-        from isaaclab.sensors import Camera
-        from leisaac.policy import LeRobotServicePolicyClient
-
-        model_type = "lerobot"
-
-        policy_type = args_cli.policy_type.split("-")[1]
-        policy = LeRobotServicePolicyClient(
-            host=args_cli.policy_host,
-            port=args_cli.policy_port,
-            timeout_ms=args_cli.policy_timeout_ms,
-            camera_infos={
-                key: sensor.image_shape for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)
-            },
-            task_type=task_type,
-            policy_type=policy_type,
-            pretrained_name_or_path=args_cli.policy_checkpoint_path,
-            actions_per_chunk=args_cli.policy_action_horizon,
-            device=args_cli.device,
-        )
-    elif args_cli.policy_type == "openpi":
-        from isaaclab.sensors import Camera
-        from leisaac.policy import OpenPIServicePolicyClient
-
-        policy = OpenPIServicePolicyClient(
-            host=args_cli.policy_host,
-            port=args_cli.policy_port,
-            camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
-            task_type=task_type,
-        )
+    model_type = "lerobot" if "lerobot" in args_cli.policy_type else args_cli.policy_type
+    policy = build_policy(env, task_type)
 
     rate_limiter = RateLimiter(args_cli.step_hz)
     controller = Controller()
@@ -266,10 +266,13 @@ def main():
             f"[Evaluation] now success rate: {success_count / (episode_count - 1)} "
             f" [{success_count}/{episode_count - 1}]"
         )
-    print(
-        f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
-        f" [{success_count}/{max_episode_count}]"
-    )
+    if max_episode_count > 0:
+        print(
+            f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
+            f" [{success_count}/{max_episode_count}]"
+        )
+    else:
+        print(f"[Evaluation] Episodes finished: {episode_count - 1}, successes: {success_count}")
 
     # close the simulator
     env.close()

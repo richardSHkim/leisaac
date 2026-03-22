@@ -4,10 +4,10 @@ import time
 import grpc
 import numpy as np
 import torch
-from leisaac.utils.constant import SINGLE_ARM_JOINT_NAMES
 from leisaac.utils.robot_utils import (
     convert_leisaac_action_to_lerobot,
     convert_lerobot_action_to_leisaac,
+    get_lerobot_joint_names,
 )
 
 from .base import Policy, WebsocketServicePolicy, ZMQServicePolicy
@@ -15,6 +15,20 @@ from .lerobot.helpers import RemotePolicyConfig, TimedObservation
 from .lerobot.transport import services_pb2, services_pb2_grpc
 from .lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from .openpi import image_tools
+
+
+def _get_gr00t_stream_names(task_type: str, modality_keys: list[str]) -> tuple[str, str]:
+    if task_type == "piperleader" and "arm_joints" in modality_keys:
+        return "arm_joints", "gripper"
+    return "single_arm", "gripper"
+
+
+def _get_arm_state_dim(task_type: str) -> int:
+    return 6 if task_type == "piperleader" else 5
+
+
+def _get_gr00t_language_key(task_type: str) -> str:
+    return "task" if task_type == "piperleader" else "annotation.human.task_description"
 
 
 class Gr00tServicePolicyClient(ZMQServicePolicy):
@@ -30,6 +44,7 @@ class Gr00tServicePolicyClient(ZMQServicePolicy):
         timeout_ms: int = 5000,
         camera_keys: list[str] = ["front", "wrist"],
         modality_keys: list[str] = ["single_arm", "gripper"],
+        task_type: str = "so101leader",
     ):
         """
         Args:
@@ -42,14 +57,17 @@ class Gr00tServicePolicyClient(ZMQServicePolicy):
         super().__init__(host=host, port=port, timeout_ms=timeout_ms, ping_endpoint="ping")
         self.camera_keys = camera_keys
         self.modality_keys = modality_keys
+        self.task_type = task_type
 
     def get_action(self, observation_dict: dict) -> torch.Tensor:
         obs_dict = {f"video.{key}": observation_dict[key].cpu().numpy().astype(np.uint8) for key in self.camera_keys}
 
-        if "single_arm" in self.modality_keys:
-            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
-            obs_dict["state.single_arm"] = joint_pos[:, 0:5].astype(np.float64)
-            obs_dict["state.gripper"] = joint_pos[:, 5:6].astype(np.float64)
+        joint_state_key, gripper_state_key = _get_gr00t_stream_names(self.task_type, self.modality_keys)
+        arm_state_dim = _get_arm_state_dim(self.task_type)
+        if joint_state_key in self.modality_keys:
+            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"], task_type=self.task_type)
+            obs_dict[f"state.{joint_state_key}"] = joint_pos[:, 0:arm_state_dim].astype(np.float64)
+            obs_dict[f"state.{gripper_state_key}"] = joint_pos[:, arm_state_dim : arm_state_dim + 1].astype(np.float64)
         # TODO: add bi-arm support
 
         obs_dict["annotation.human.task_description"] = [observation_dict["task_description"]]
@@ -76,10 +94,10 @@ class Gr00tServicePolicyClient(ZMQServicePolicy):
             }
         """
         concat_action = np.concatenate(
-            [action_chunk["action.single_arm"], action_chunk["action.gripper"]],
+            [action_chunk[f"action.{joint_state_key}"], action_chunk[f"action.{gripper_state_key}"]],
             axis=1,
         )
-        concat_action = convert_lerobot_action_to_leisaac(concat_action)
+        concat_action = convert_lerobot_action_to_leisaac(concat_action, task_type=self.task_type)
 
         return torch.from_numpy(concat_action[:, None, :])
 
@@ -97,6 +115,7 @@ class Gr00t16ServicePolicyClient(ZMQServicePolicy):
         timeout_ms: int = 5000,
         camera_keys: list[str] = ["front", "wrist"],
         modality_keys: list[str] = ["single_arm", "gripper"],
+        task_type: str = "so101leader",
     ):
         """
         Args:
@@ -109,6 +128,7 @@ class Gr00t16ServicePolicyClient(ZMQServicePolicy):
         super().__init__(host=host, port=port, timeout_ms=timeout_ms, ping_endpoint="ping")
         self.camera_keys = camera_keys
         self.modality_keys = modality_keys
+        self.task_type = task_type
 
     def get_action(self, observation_dict: dict) -> torch.Tensor:
         # Build the 'video' dictionary: {camera_name: (B, T, H, W, 3), dtype=uint8}
@@ -119,19 +139,20 @@ class Gr00t16ServicePolicyClient(ZMQServicePolicy):
 
         # Build the 'state' dictionary (single_arm, gripper)
         state = {}
-        if "single_arm" in self.modality_keys:
-            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
+        joint_state_key, gripper_state_key = _get_gr00t_stream_names(self.task_type, self.modality_keys)
+        arm_state_dim = _get_arm_state_dim(self.task_type)
+        if joint_state_key in self.modality_keys:
+            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"], task_type=self.task_type)
             # Add a new axis at the front (batch dim)
             joint_pos = np.expand_dims(joint_pos, axis=0)
-            # Ensure joint_pos shape is (B, T, 6), we need (B, T, D) for each stream
-            # e.g., single_arm: first 5 dims, gripper: last dim
-            state["single_arm"] = joint_pos[..., 0:5].astype(np.float32)
-            state["gripper"] = joint_pos[..., 5:6].astype(np.float32)
+            state[joint_state_key] = joint_pos[..., 0:arm_state_dim].astype(np.float32)
+            state[gripper_state_key] = joint_pos[..., arm_state_dim : arm_state_dim + 1].astype(np.float32)
         # TODO: add bi-arm support
 
         # Build the 'language' dictionary
+        language_key = _get_gr00t_language_key(self.task_type)
         language = {
-            "annotation.human.task_description": [[observation_dict["task_description"]]],
+            language_key: [[observation_dict["task_description"]]],
         }
 
         # Compose the final observation dictionary as required
@@ -168,14 +189,23 @@ class Gr00t16ServicePolicyClient(ZMQServicePolicy):
                 "gripper": np.zeros((1, 16, 1)),
             }]
         """
-        action_chunk = action_chunk[0]
+        if isinstance(action_chunk, list):
+            action_chunk = action_chunk[0]
+        elif not isinstance(action_chunk, dict):
+            raise TypeError(f"Unexpected GR00T action chunk type: {type(action_chunk)}")
+
+        if joint_state_key not in action_chunk or gripper_state_key not in action_chunk:
+            raise KeyError(
+                f"GR00T action chunk missing expected keys. "
+                f"Expected: {[joint_state_key, gripper_state_key]}, got: {list(action_chunk.keys())}"
+            )
         concat_action = np.concatenate(
-            [action_chunk["single_arm"], action_chunk["gripper"]],
+            [action_chunk[joint_state_key], action_chunk[gripper_state_key]],
             axis=-1,
         )
         # squeeze the first dimension
         concat_action = concat_action.squeeze(0)
-        concat_action = convert_lerobot_action_to_leisaac(concat_action)
+        concat_action = convert_lerobot_action_to_leisaac(concat_action, task_type=self.task_type)
 
         return torch.from_numpy(concat_action[:, None, :])
 
@@ -222,9 +252,16 @@ class LeRobotServicePolicyClient(Policy):
             lerobot_features["observation.state"] = {
                 "dtype": "float32",
                 "shape": (6,),
-                "names": [f"{joint_name}.pos" for joint_name in SINGLE_ARM_JOINT_NAMES],
+                "names": get_lerobot_joint_names(task_type=task_type),
             }
             self.last_action = np.zeros((1, 6))
+        elif task_type == "piperleader":
+            lerobot_features["observation.state"] = {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": get_lerobot_joint_names(task_type=task_type),
+            }
+            self.last_action = np.zeros((1, 7))
         # TODO: add bi-arm support
 
         for camera_key, camera_image_shape in camera_infos.items():
@@ -271,10 +308,11 @@ class LeRobotServicePolicyClient(Policy):
         }
         raw_observation["task"] = observation_dict["task_description"]
 
-        if self.task_type == "so101leader":
-            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
-            for joint_name in SINGLE_ARM_JOINT_NAMES:
-                raw_observation[f"{joint_name}.pos"] = joint_pos[0, SINGLE_ARM_JOINT_NAMES.index(joint_name)].item()
+        joint_feature_names = get_lerobot_joint_names(task_type=self.task_type)
+        if self.task_type in ["so101leader", "piperleader"]:
+            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"], task_type=self.task_type)
+            for idx, joint_name in enumerate(joint_feature_names):
+                raw_observation[joint_name] = joint_pos[0, idx].item()
         # TODO: add bi-arm support
 
         """
@@ -325,7 +363,7 @@ class LeRobotServicePolicyClient(Policy):
 
         action_list = [action.get_action()[None, :] for action in action_chunk]
         concat_action = torch.cat(action_list, dim=0)
-        concat_action = convert_lerobot_action_to_leisaac(concat_action)
+        concat_action = convert_lerobot_action_to_leisaac(concat_action, task_type=self.task_type)
 
         self.last_action = concat_action[-1, :]
         self.skip_send_observation = False
@@ -368,8 +406,8 @@ class OpenPIServicePolicyClient(WebsocketServicePolicy):
             for key in self.camera_keys
         }
 
-        if self.task_type == "so101leader":
-            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"])
+        if self.task_type in ["so101leader", "piperleader"]:
+            joint_pos = convert_leisaac_action_to_lerobot(observation_dict["joint_pos"], task_type=self.task_type)
             obs_dict["state"] = joint_pos.squeeze().astype(np.float64)
         # TODO: add bi-arm support
 
@@ -392,6 +430,6 @@ class OpenPIServicePolicyClient(WebsocketServicePolicy):
             Example of action_chunk for single arm task:
             action_chunk: np.zeros((10, 6))
         """
-        processed_action = convert_lerobot_action_to_leisaac(action_chunk)
+        processed_action = convert_lerobot_action_to_leisaac(action_chunk, task_type=self.task_type)
 
         return torch.from_numpy(processed_action[:, None, :])

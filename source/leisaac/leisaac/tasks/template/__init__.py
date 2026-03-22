@@ -21,3 +21,9 @@ from .single_arm_env_cfg import (
     SingleArmTaskSceneCfg,
     SingleArmTerminationsCfg,
 )
+from .piper_single_arm_env_cfg import (
+    PiperSingleArmObservationsCfg,
+    PiperSingleArmTaskEnvCfg,
+    PiperSingleArmTaskSceneCfg,
+    PiperSingleArmTerminationsCfg,
+)

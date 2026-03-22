@@ -22,9 +22,19 @@ def _resolve_assets_root() -> str:
     return (_detect_git_root() / "assets").resolve().as_posix()
 
 
+REPO_ROOT = _detect_git_root().resolve()
 ASSETS_ROOT = _resolve_assets_root()
 
 SINGLE_ARM_JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+PIPER_SINGLE_ARM_JOINT_NAMES = [
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6",
+    "gripper",
+]
 BI_ARM_JOINT_NAMES = [
     "left_shoulder_pan",
     "left_shoulder_lift",

@@ -3,7 +3,7 @@ from pathlib import Path
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
-from leisaac.utils.constant import ASSETS_ROOT
+from leisaac.utils.constant import ASSETS_ROOT, REPO_ROOT
 
 """Configuration for the SO101 Follower Robot."""
 SO101_FOLLOWER_ASSET_PATH = Path(ASSETS_ROOT) / "robots" / "so101_follower.usd"
@@ -136,3 +136,73 @@ LEKIWI_CFG = ArticulationCfg(
     },
     soft_joint_pos_limit_factor=1.0,
 )
+
+
+"""Configuration for the PiPER Follower Robot."""
+PIPER_FOLLOWER_ASSET_PATH = Path(ASSETS_ROOT) / "robots" / "piper.usd"
+
+PIPER_FOLLOWER_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=str(PIPER_FOLLOWER_ASSET_PATH),
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=True,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=4,
+            fix_root_link=True,
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.35, -0.64, 0.01),
+        rot=(0.70710678, 0.0, 0.0, 0.70710678),
+        joint_pos={
+            "joint1": 0.0,
+            "joint2": 0.0,
+            "joint3": 0.0,
+            "joint4": 0.0,
+            "joint5": 0.0,
+            "joint6": 0.0,
+            "joint7": 0.0,
+            "joint8": 0.0,
+        },
+    ),
+    actuators={
+        "piper-arm": ImplicitActuatorCfg(
+            joint_names_expr=["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=3.5,
+            stiffness=80.0,
+            damping=8.0,
+        ),
+        "piper-gripper": ImplicitActuatorCfg(
+            joint_names_expr=["joint7", "joint8"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=1.5,
+            stiffness=400.0,
+            damping=40.0,
+        ),
+    },
+    soft_joint_pos_limit_factor=1.0,
+)
+
+PIPER_FOLLOWER_USD_JOINT_LIMITS = {
+    "joint_1": (-2.618, 2.618),
+    "joint_2": (0.0, 3.14),
+    "joint_3": (-2.697, 0.0),
+    "joint_4": (-1.832, 1.832),
+    "joint_5": (-1.22, 1.22),
+    "joint_6": (-3.14, 3.14),
+    "gripper": (0.0, 0.05),
+}
+
+PIPER_FOLLOWER_MOTOR_LIMITS = {
+    "joint_1": (-2.618, 2.618),
+    "joint_2": (0.0, 3.14),
+    "joint_3": (-2.697, 0.0),
+    "joint_4": (-1.832, 1.832),
+    "joint_5": (-1.22, 1.22),
+    "joint_6": (-3.14, 3.14),
+    "gripper": (0.0, 1.0),
+}

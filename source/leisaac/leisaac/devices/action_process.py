@@ -3,7 +3,9 @@ from typing import Any
 
 import isaaclab.envs.mdp as mdp
 import torch
+from leisaac.devices.piper_gripper_action import PiperSymmetricGripperActionCfg
 from leisaac.assets.robots.lerobot import SO101_FOLLOWER_USD_JOINT_LIMLITS
+from leisaac.utils.robot_utils import convert_lerobot_action_to_leisaac
 
 
 def init_action_cfg(action_cfg, device):
@@ -18,6 +20,16 @@ def init_action_cfg(action_cfg, device):
             asset_name="robot",
             joint_names=["gripper"],
             scale=1.0,
+        )
+    elif device in ["piperleader"]:
+        action_cfg.arm_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+            scale=1.0,
+        )
+        action_cfg.gripper_action = PiperSymmetricGripperActionCfg(
+            asset_name="robot",
+            joint_names=["joint7", "joint8"],
         )
     elif device in ["keyboard", "gamepad", "lekiwi-keyboard", "lekiwi-gamepad"]:
         action_cfg.arm_action = mdp.DifferentialInverseKinematicsActionCfg(
@@ -189,6 +201,27 @@ def preprocess_device_action(action: dict[str, Any], teleop_device) -> torch.Ten
     elif action.get("lekiwi-keyboard") is not None or action.get("lekiwi-gamepad") is not None:
         processed_action = torch.zeros(teleop_device.env.num_envs, 11, device=teleop_device.env.device)
         processed_action[:, :] = action["joint_state"]
+    elif action.get("piper_leader") is not None:
+        processed_action = torch.zeros(teleop_device.env.num_envs, 7, device=teleop_device.env.device)
+        leader_action = action["joint_state"]
+        lerobot_action = torch.tensor(
+            [
+                [
+                    leader_action["joint_1.pos"],
+                    leader_action["joint_2.pos"],
+                    leader_action["joint_3.pos"],
+                    leader_action["joint_4.pos"],
+                    leader_action["joint_5.pos"],
+                    leader_action["joint_6.pos"],
+                    leader_action["gripper.pos"],
+                ]
+            ],
+            device=teleop_device.env.device,
+        )
+        processed_action[:, :] = torch.tensor(
+            convert_lerobot_action_to_leisaac(lerobot_action, task_type="piperleader"),
+            device=teleop_device.env.device,
+        )
     else:
         raise NotImplementedError(f"Not implemented for this device now: {teleop_device.device_type}")
     return processed_action
