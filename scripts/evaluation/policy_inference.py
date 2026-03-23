@@ -6,6 +6,8 @@ import multiprocessing
 if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 import argparse
+from math import ceil, sqrt
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -37,6 +39,17 @@ parser.add_argument("--policy_timeout_ms", type=int, default=15000, help="Timeou
 parser.add_argument("--policy_action_horizon", type=int, default=16, help="Action horizon of the policy.")
 parser.add_argument("--policy_language_instruction", type=str, default=None, help="Language instruction of the policy.")
 parser.add_argument("--policy_checkpoint_path", type=str, default=None, help="Checkpoint path of the policy.")
+parser.add_argument(
+    "--save_eval_video_dir",
+    type=str,
+    default="leisaac_outputs/policy_inference_videos",
+    help="Directory to save per-evaluation-round camera videos.",
+)
+parser.add_argument(
+    "--disable_eval_video",
+    action="store_true",
+    help="Disable per-evaluation-round camera video dumps.",
+)
 
 
 # append AppLauncher cli args
@@ -54,6 +67,7 @@ import time
 
 import carb
 import gymnasium as gym
+import numpy as np
 import omni
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
@@ -122,6 +136,175 @@ class Controller:
         return True
 
 
+def get_registered_camera_keys(env: ManagerBasedRLEnv) -> list[str]:
+    from isaaclab.sensors import Camera
+
+    return [key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)]
+
+
+def to_uint8_rgb_frame(frame) -> np.ndarray:
+    if isinstance(frame, torch.Tensor):
+        frame = frame.detach().cpu().numpy()
+    frame = np.asarray(frame)
+    while frame.ndim > 3 and frame.shape[0] == 1:
+        frame = frame[0]
+    if frame.ndim != 3:
+        raise ValueError(f"Expected a camera frame with shape (H, W, C), got {frame.shape}")
+    if frame.shape[-1] > 3:
+        frame = frame[..., :3]
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    return frame
+
+
+class EpisodeVideoRecorder:
+    def __init__(self, output_dir: Path, camera_keys: list[str], fps: int, enabled: bool = True):
+        self.output_dir = output_dir
+        self.camera_keys = camera_keys
+        self.fps = fps
+        self.enabled = enabled and len(camera_keys) > 0
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self._cv2 = None
+        self._writer = None
+        self._current_episode = None
+        self._pending_path = None
+        self._frame_count = 0
+        self._last_frame = None
+        self._last_timestamp = None
+
+    def start_episode(self, episode_idx: int):
+        if not self.enabled:
+            return
+        self.close(status="interrupted")
+        self._current_episode = episode_idx
+        self._pending_path = self.output_dir / f"episode_{episode_idx:04d}_pending.mp4"
+        self._frame_count = 0
+        self._last_frame = None
+        self._last_timestamp = None
+
+    def add_frames(self, camera_frames: dict[str, np.ndarray], timestamp: float | None = None):
+        if not self.enabled or self._current_episode is None or len(camera_frames) == 0:
+            return
+        if timestamp is None:
+            timestamp = time.time()
+        frame = self._compose_frame(camera_frames)
+        if self._writer is None:
+            self._open_writer(width=frame.shape[1], height=frame.shape[0])
+        if self._last_frame is None:
+            self._last_frame = frame
+            self._last_timestamp = timestamp
+            return
+
+        elapsed = max(0.0, timestamp - self._last_timestamp)
+        repeat_count = max(1, int(round(elapsed * self.fps)))
+        self._write_frame(self._last_frame, repeat_count=repeat_count)
+        self._last_frame = frame
+        self._last_timestamp = timestamp
+
+    def add_observation(self, observation_dict: dict, timestamp: float | None = None):
+        if not self.enabled or self._current_episode is None:
+            return
+        camera_frames = {
+            camera_key: observation_dict[camera_key]
+            for camera_key in self.camera_keys
+            if camera_key in observation_dict
+        }
+        self.add_frames(camera_frames, timestamp=timestamp)
+
+    def close(self, status: str):
+        if not self.enabled or self._current_episode is None:
+            return None
+
+        if self._last_frame is not None:
+            self._write_frame(self._last_frame, repeat_count=1)
+            self._last_frame = None
+            self._last_timestamp = None
+
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+
+        final_path = None
+        if self._pending_path is not None and self._pending_path.exists():
+            final_path = self.output_dir / f"episode_{self._current_episode:04d}_{status}.mp4"
+            self._pending_path.replace(final_path)
+            print(
+                f"[Evaluation] Saved episode {self._current_episode} video to {final_path}"
+                f" ({self._frame_count} frames, status={status})."
+            )
+        elif self._frame_count == 0:
+            print(f"[Evaluation] Skipped video for episode {self._current_episode}: no camera frames were sent.")
+
+        self._current_episode = None
+        self._pending_path = None
+        self._frame_count = 0
+        return final_path
+
+    def _ensure_cv2(self):
+        if self._cv2 is None:
+            import cv2
+
+            self._cv2 = cv2
+
+    def _open_writer(self, width: int, height: int):
+        self._ensure_cv2()
+        if self._pending_path is None:
+            raise RuntimeError("Video recorder has not been started for the current episode.")
+        fourcc = self._cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = self._cv2.VideoWriter(str(self._pending_path), fourcc, float(self.fps), (width, height))
+        if not self._writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {self._pending_path}")
+
+    def _write_frame(self, frame: np.ndarray, repeat_count: int):
+        if self._writer is None:
+            raise RuntimeError("Video writer must be opened before writing frames.")
+        bgr_frame = self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR)
+        for _ in range(repeat_count):
+            self._writer.write(bgr_frame)
+        self._frame_count += repeat_count
+
+    def _compose_frame(self, camera_frames: dict[str, np.ndarray]) -> np.ndarray:
+        ordered_frames = []
+        for camera_key in self.camera_keys:
+            if camera_key in camera_frames:
+                ordered_frames.append((camera_key, to_uint8_rgb_frame(camera_frames[camera_key])))
+        for camera_key, frame in camera_frames.items():
+            if camera_key not in self.camera_keys:
+                ordered_frames.append((camera_key, to_uint8_rgb_frame(frame)))
+        if len(ordered_frames) == 0:
+            raise ValueError("No camera frames available to compose into a video frame.")
+
+        self._ensure_cv2()
+
+        cell_height = max(frame.shape[0] for _, frame in ordered_frames)
+        cell_width = max(frame.shape[1] for _, frame in ordered_frames)
+        title_height = 28
+        column_count = 1 if len(ordered_frames) == 1 else int(ceil(sqrt(len(ordered_frames))))
+        row_count = int(ceil(len(ordered_frames) / column_count))
+        canvas = np.zeros((row_count * (cell_height + title_height), column_count * cell_width, 3), dtype=np.uint8)
+
+        for index, (camera_key, frame) in enumerate(ordered_frames):
+            row = index // column_count
+            col = index % column_count
+            x0 = col * cell_width
+            y0 = row * (cell_height + title_height)
+            frame_height, frame_width = frame.shape[:2]
+            canvas[y0 + title_height : y0 + title_height + frame_height, x0 : x0 + frame_width] = frame
+            self._cv2.putText(
+                canvas,
+                camera_key,
+                (x0 + 8, y0 + 19),
+                self._cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                1,
+                self._cv2.LINE_AA,
+            )
+
+        return canvas
+
+
 def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: str):
     """Preprocess the observation dictionary to the format expected by the policy."""
     if model_type in ["gr00tn1.5", "gr00tn1.6", "lerobot", "openpi"]:
@@ -134,7 +317,7 @@ def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: s
 def build_policy(env: ManagerBasedRLEnv, task_type: str):
     from isaaclab.sensors import Camera
 
-    camera_keys = [key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)]
+    camera_keys = get_registered_camera_keys(env)
     camera_infos = {key: sensor.image_shape for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)}
 
     if args_cli.policy_type == "gr00tn1.5":
@@ -214,6 +397,13 @@ def main():
     # create policy
     model_type = "lerobot" if "lerobot" in args_cli.policy_type else args_cli.policy_type
     policy = build_policy(env, task_type)
+    camera_keys = get_registered_camera_keys(env)
+    video_recorder = EpisodeVideoRecorder(
+        output_dir=Path(args_cli.save_eval_video_dir),
+        camera_keys=camera_keys,
+        fps=args_cli.step_hz,
+        enabled=not args_cli.disable_eval_video,
+    )
 
     rate_limiter = RateLimiter(args_cli.step_hz)
     controller = Controller()
@@ -227,12 +417,15 @@ def main():
 
     # simulate environment
     while max_episode_count <= 0 or episode_count <= max_episode_count:
+        video_recorder.start_episode(episode_count)
+        video_recorder.add_observation(obs_dict["policy"], timestamp=time.time())
         print(f"[Evaluation] Evaluating episode {episode_count}...")
         success, time_out = False, False
         while simulation_app.is_running():
             # run everything in inference mode
             with torch.inference_mode():
                 if controller.reset_state:
+                    video_recorder.close(status="manual_reset")
                     controller.reset()
                     obs_dict, _ = env.reset()
                     episode_count += 1
@@ -245,6 +438,7 @@ def main():
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
                     obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
+                    video_recorder.add_observation(obs_dict["policy"], timestamp=time.time())
                     if reset_terminated[0]:
                         success = True
                         break
@@ -253,19 +447,27 @@ def main():
                         break
                     if rate_limiter:
                         rate_limiter.sleep(env)
-            if success:
-                print(f"[Evaluation] Episode {episode_count} is successful!")
-                episode_count += 1
-                success_count += 1
+            if success or time_out:
                 break
-            if time_out:
-                print(f"[Evaluation] Episode {episode_count} timed out!")
-                episode_count += 1
-                break
-        print(
-            f"[Evaluation] now success rate: {success_count / (episode_count - 1)} "
-            f" [{success_count}/{episode_count - 1}]"
-        )
+        if not simulation_app.is_running():
+            video_recorder.close(status="stopped")
+            break
+        if success:
+            video_recorder.close(status="success")
+            print(f"[Evaluation] Episode {episode_count} is successful!")
+            episode_count += 1
+            success_count += 1
+        if time_out:
+            video_recorder.close(status="time_out")
+            print(f"[Evaluation] Episode {episode_count} timed out!")
+            episode_count += 1
+
+        finished_episode_count = episode_count - 1
+        if finished_episode_count > 0:
+            print(
+                f"[Evaluation] now success rate: {success_count / finished_episode_count} "
+                f" [{success_count}/{finished_episode_count}]"
+            )
     if max_episode_count > 0:
         print(
             f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
