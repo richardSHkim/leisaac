@@ -6,9 +6,12 @@ if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 
 import argparse
+import copy
 import contextlib
 import os
 import time
+from math import ceil, sqrt
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -36,6 +39,17 @@ parser.add_argument(
     action="store_true",
     help="Ignore converted initial robot joints and keep the task's default reset robot state.",
 )
+parser.add_argument(
+    "--save_replay_video_dir",
+    type=str,
+    default="leisaac_outputs/piper_replay_videos",
+    help="Directory to save per-replayed-episode camera videos.",
+)
+parser.add_argument(
+    "--disable_replay_video",
+    action="store_true",
+    help="Disable per-replayed-episode camera video dumps.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -44,8 +58,10 @@ app_launcher = AppLauncher(vars(args_cli))
 simulation_app = app_launcher.app
 
 import gymnasium as gym
+import numpy as np
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.sensors import Camera
 from isaaclab.utils.datasets import HDF5DatasetFileHandler
 from isaaclab_tasks.utils import parse_env_cfg
 from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim, get_task_type
@@ -74,6 +90,172 @@ class RateLimiter:
                 self.last_time += self.sleep_duration
 
 
+def get_registered_camera_keys(env: ManagerBasedRLEnv) -> list[str]:
+    return [key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)]
+
+
+def to_uint8_rgb_frame(frame) -> np.ndarray:
+    if isinstance(frame, torch.Tensor):
+        frame = frame.detach().cpu().numpy()
+    frame = np.asarray(frame)
+    while frame.ndim > 3 and frame.shape[0] == 1:
+        frame = frame[0]
+    if frame.ndim != 3:
+        raise ValueError(f"Expected a camera frame with shape (H, W, C), got {frame.shape}")
+    if frame.shape[-1] > 3:
+        frame = frame[..., :3]
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    return frame
+
+
+class EpisodeVideoRecorder:
+    def __init__(self, output_dir: Path, camera_keys: list[str], fps: int, enabled: bool = True):
+        self.output_dir = output_dir
+        self.camera_keys = camera_keys
+        self.fps = fps
+        self.enabled = enabled and len(camera_keys) > 0
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self._cv2 = None
+        self._writer = None
+        self._current_episode = None
+        self._pending_path = None
+        self._frame_count = 0
+        self._last_frame = None
+        self._last_timestamp = None
+
+    def start_episode(self, episode_name: str):
+        if not self.enabled:
+            return
+        self.close(status="interrupted")
+        safe_episode_name = episode_name.replace("/", "_")
+        self._current_episode = safe_episode_name
+        self._pending_path = self.output_dir / f"{safe_episode_name}_pending.mp4"
+        self._frame_count = 0
+        self._last_frame = None
+        self._last_timestamp = None
+
+    def add_observation(self, observation_dict: dict, timestamp: float | None = None):
+        if not self.enabled or self._current_episode is None:
+            return
+        if timestamp is None:
+            timestamp = time.time()
+        camera_frames = {
+            camera_key: observation_dict[camera_key]
+            for camera_key in self.camera_keys
+            if camera_key in observation_dict
+        }
+        if len(camera_frames) == 0:
+            return
+
+        frame = self._compose_frame(camera_frames)
+        if self._writer is None:
+            self._open_writer(width=frame.shape[1], height=frame.shape[0])
+        if self._last_frame is None:
+            self._last_frame = frame
+            self._last_timestamp = timestamp
+            return
+
+        elapsed = max(0.0, timestamp - self._last_timestamp)
+        repeat_count = max(1, int(round(elapsed * self.fps)))
+        self._write_frame(self._last_frame, repeat_count=repeat_count)
+        self._last_frame = frame
+        self._last_timestamp = timestamp
+
+    def close(self, status: str):
+        if not self.enabled or self._current_episode is None:
+            return None
+
+        if self._last_frame is not None:
+            self._write_frame(self._last_frame, repeat_count=1)
+            self._last_frame = None
+            self._last_timestamp = None
+
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+
+        final_path = None
+        if self._pending_path is not None and self._pending_path.exists():
+            final_path = self.output_dir / f"{self._current_episode}_{status}.mp4"
+            self._pending_path.replace(final_path)
+            print(
+                f"[Replay] Saved episode video to {final_path}"
+                f" ({self._frame_count} frames, status={status})."
+            )
+        elif self._frame_count == 0:
+            print(f"[Replay] Skipped video for episode {self._current_episode}: no camera frames were available.")
+
+        self._current_episode = None
+        self._pending_path = None
+        self._frame_count = 0
+        return final_path
+
+    def _ensure_cv2(self):
+        if self._cv2 is None:
+            import cv2
+
+            self._cv2 = cv2
+
+    def _open_writer(self, width: int, height: int):
+        self._ensure_cv2()
+        if self._pending_path is None:
+            raise RuntimeError("Video recorder has not been started for the current episode.")
+        fourcc = self._cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = self._cv2.VideoWriter(str(self._pending_path), fourcc, float(self.fps), (width, height))
+        if not self._writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {self._pending_path}")
+
+    def _write_frame(self, frame: np.ndarray, repeat_count: int):
+        if self._writer is None:
+            raise RuntimeError("Video writer must be opened before writing frames.")
+        bgr_frame = self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR)
+        for _ in range(repeat_count):
+            self._writer.write(bgr_frame)
+        self._frame_count += repeat_count
+
+    def _compose_frame(self, camera_frames: dict[str, np.ndarray]) -> np.ndarray:
+        ordered_frames = []
+        for camera_key in self.camera_keys:
+            if camera_key in camera_frames:
+                ordered_frames.append((camera_key, to_uint8_rgb_frame(camera_frames[camera_key])))
+        for camera_key, frame in camera_frames.items():
+            if camera_key not in self.camera_keys:
+                ordered_frames.append((camera_key, to_uint8_rgb_frame(frame)))
+        if len(ordered_frames) == 0:
+            raise ValueError("No camera frames available to compose into a video frame.")
+
+        self._ensure_cv2()
+
+        cell_height = max(frame.shape[0] for _, frame in ordered_frames)
+        cell_width = max(frame.shape[1] for _, frame in ordered_frames)
+        title_height = 28
+        column_count = 1 if len(ordered_frames) == 1 else int(ceil(sqrt(len(ordered_frames))))
+        row_count = int(ceil(len(ordered_frames) / column_count))
+        canvas = np.zeros((row_count * (cell_height + title_height), column_count * cell_width, 3), dtype=np.uint8)
+
+        for index, (camera_key, frame) in enumerate(ordered_frames):
+            row = index // column_count
+            col = index % column_count
+            x0 = col * cell_width
+            y0 = row * (cell_height + title_height)
+            frame_height, frame_width = frame.shape[:2]
+            canvas[y0 + title_height : y0 + title_height + frame_height, x0 : x0 + frame_width] = frame
+            self._cv2.putText(
+                canvas,
+                camera_key,
+                (x0 + 8, y0 + 19),
+                self._cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                1,
+                self._cv2.LINE_AA,
+            )
+
+        return canvas
+
+
 def sort_episode_names(episode_names: list[str]) -> list[str]:
     def sort_key(name: str):
         try:
@@ -85,11 +267,11 @@ def sort_episode_names(episode_names: list[str]) -> list[str]:
 
 
 def build_episode_reset_state(
-    env: ManagerBasedRLEnv,
+    default_reset_state: dict,
     episode_initial_state: dict | None,
     override_initial_robot_state: bool,
 ):
-    reset_state = env.scene.get_state(is_relative=True)
+    reset_state = copy.deepcopy(default_reset_state)
     if override_initial_robot_state or episode_initial_state is None:
         return reset_state
 
@@ -133,6 +315,15 @@ def main():
     env: ManagerBasedRLEnv = gym.make(args_cli.task, cfg=env_cfg).unwrapped
     action_dim = env.action_manager.total_action_dim
     rate_limiter = RateLimiter(args_cli.step_hz)
+    camera_keys = get_registered_camera_keys(env)
+    video_recorder = EpisodeVideoRecorder(
+        output_dir=Path(args_cli.save_replay_video_dir),
+        camera_keys=camera_keys,
+        fps=args_cli.step_hz,
+        enabled=not args_cli.disable_replay_video,
+    )
+    env.reset(seed=args_cli.seed)
+    default_reset_state = copy.deepcopy(env.scene.get_state(is_relative=True))
 
     print(
         f"[Replay] task={args_cli.task}, task_type={task_type}, action_dim={action_dim}, "
@@ -161,13 +352,12 @@ def main():
                         f"Episode {episode_name} action dim {actions.shape[-1]} does not match env action dim {action_dim}"
                     )
 
-                env.reset(seed=int(episode.seed) if episode.seed is not None else args_cli.seed)
                 replay_reset_state = build_episode_reset_state(
-                    env,
+                    default_reset_state,
                     initial_state,
                     override_initial_robot_state=args_cli.override_initial_robot_state,
                 )
-                env.reset_to(
+                obs_dict, _ = env.reset_to(
                     replay_reset_state,
                     None,
                     seed=int(episode.seed) if episode.seed is not None else None,
@@ -175,17 +365,25 @@ def main():
                 )
                 replayed_episode_count += 1
                 print(f"[Replay] episode={episode_index} ({episode_name}), steps={actions.shape[0]}")
+                video_recorder.start_episode(episode_name)
+                video_recorder.add_observation(obs_dict["policy"], timestamp=time.time())
 
                 while simulation_app.is_running() and not simulation_app.is_exiting():
                     action = episode.get_next_action()
                     if action is None:
+                        video_recorder.close(status="completed")
                         break
                     action = action.reshape(1, -1).to(env.device)
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
-                    env.step(action)
+                    obs_dict, _, _, _, _ = env.step(action)
+                    video_recorder.add_observation(obs_dict["policy"], timestamp=time.time())
                     rate_limiter.sleep(env)
+                if not simulation_app.is_running() or simulation_app.is_exiting():
+                    video_recorder.close(status="stopped")
+                    break
 
+    video_recorder.close(status="stopped")
     print(f"[Replay] Finished replaying {replayed_episode_count} episode{'s' if replayed_episode_count != 1 else ''}.")
     dataset_file_handler.close()
     env.close()
