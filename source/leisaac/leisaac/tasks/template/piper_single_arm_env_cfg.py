@@ -110,7 +110,7 @@ class PiperSingleArmTaskSceneCfg(InteractiveSceneCfg):
     base: TiledCameraCfg = TiledCameraCfg(
         prim_path=f"{PIPER_ARM_BASE_PRIM_PATH}/base_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(-0.55, -0.7, 0.42), rot=(0.77337, 0.55078, -0.2374, -0.20537), convention="opengl"
+            pos=(-0.12, -0.40, 0.70), rot=(0.77337, 0.55078, -0.2374, -0.20537), convention="opengl"
         ),
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg.from_intrinsic_matrix(

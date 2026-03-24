@@ -8,7 +8,6 @@ from isaaclab.utils import configclass
 from leisaac.assets.scenes.simple import TABLE_WITH_CUBE_CFG, TABLE_WITH_CUBE_USD_PATH
 from leisaac.utils.domain_randomization import (
     domain_randomization,
-    randomize_camera_uniform,
     randomize_object_uniform,
 )
 from leisaac.utils.general_assets import parse_usd_and_create_subassets
@@ -105,18 +104,6 @@ class PiperLiftCubeEnvCfg(PiperSingleArmTaskEnvCfg):
                         "z": (0.0, 0.0),
                         "yaw": (-30 * torch.pi / 180, 30 * torch.pi / 180),
                     },
-                ),
-                randomize_camera_uniform(
-                    "base",
-                    pose_range={
-                        "x": (-0.005, 0.005),
-                        "y": (-0.005, 0.005),
-                        "z": (-0.005, 0.005),
-                        "roll": (-0.05 * torch.pi / 180, 0.05 * torch.pi / 180),
-                        "pitch": (-0.05 * torch.pi / 180, 0.05 * torch.pi / 180),
-                        "yaw": (-0.05 * torch.pi / 180, 0.05 * torch.pi / 180),
-                    },
-                    convention="opengl",
                 ),
             ],
         )
