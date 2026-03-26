@@ -75,6 +75,7 @@ assets/scenes/*
 !assets/scenes/.gitkeep
 assets/robots/*
 !assets/robots/.gitkeep
+!assets/robots/piper.usd
 
 # greenscreen
 greenscreen/*
